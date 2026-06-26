@@ -1,0 +1,14 @@
+{
+    
+    order static_s3 before respond
+}
+
+:8080 {
+    static_s3 {
+        endpoint   http://localhost:9000
+        bucket     cdx
+        access_key admin
+        secret_key StrongPassword123
+    }
+}
+
