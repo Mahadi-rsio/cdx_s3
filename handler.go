@@ -2,6 +2,7 @@ package cdx_s3
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,13 +17,75 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/redis/go-redis/v9"
 )
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	path := r.URL.Path
+	urlPath := r.URL.Path
 
-	// Standard SPA rule: serving index.html if empty path or root
+	// ── Multi-tenant mode ──────────────────────────────────────────────────
+	if p.BaseDomain != "" {
+		// 1. Extract subdomain from Host header
+		host := r.Host
+		// Strip port if present
+		if h, _, err := splitHostPort(host); err == nil {
+			host = h
+		}
+
+		suffix := "." + p.BaseDomain
+		if !strings.HasSuffix(host, suffix) {
+			return caddyhttp.Error(http.StatusNotFound, fmt.Errorf("host %q does not match base domain", host))
+		}
+		subdomain := strings.TrimSuffix(host, suffix)
+		if subdomain == "" || strings.Contains(subdomain, ".") {
+			return caddyhttp.Error(http.StatusNotFound, fmt.Errorf("invalid subdomain %q", subdomain))
+		}
+
+		// 2. Resolve site_id via Redis → PostgreSQL
+		siteID, err := p.resolveSiteID(r.Context(), subdomain)
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+		if siteID == "" {
+			return caddyhttp.Error(http.StatusNotFound, fmt.Errorf("tenant %q not found", subdomain))
+		}
+
+		// 3. Build S3 key: {site_id}/{path}
+		cleanPath := strings.TrimPrefix(urlPath, "/")
+		var s3Key string
+		if urlPath == "/" || urlPath == "" || cleanPath == "" {
+			s3Key = siteID + "/index.html"
+		} else {
+			s3Key = siteID + "/" + cleanPath
+		}
+
+		// 4. SPA fallback: paths without extension (and not excluded) serve index.html
+		isFallbackRequest := false
+		if p.Fallback != "" {
+			if urlPath == "/" || urlPath == "" || (!hasExtension(urlPath) && !p.isExcludedFromFallback(urlPath)) {
+				s3Key = siteID + "/index.html"
+				isFallbackRequest = true
+			}
+		}
+
+		// 5. Scope LRU cache key per tenant to avoid cross-tenant collisions
+		cacheKey := subdomain + ":" + s3Key
+
+		err = p.serveObjectWithCacheKey(w, r, s3Key, cacheKey, isFallbackRequest)
+		if err != nil {
+			if p.Fallback != "" && !isFallbackRequest && p.isNotFoundError(err) && !p.isExcludedFromFallback(urlPath) {
+				fallbackKey := siteID + "/index.html"
+				fallbackCacheKey := subdomain + ":" + fallbackKey
+				return p.serveObjectWithCacheKey(w, r, fallbackKey, fallbackCacheKey, true)
+			}
+			return caddyhttp.Error(http.StatusNotFound, err)
+		}
+		return nil
+	}
+
+	// ── Single-tenant mode (existing behaviour) ────────────────────────────
+	path := urlPath
 	key := strings.TrimPrefix(path, "/")
 	if p.Prefix != "" {
 		// Clean up the key prefix combination
@@ -53,6 +116,247 @@ func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 	return nil
 }
+
+// resolveSiteID looks up the site UUID for a given subdomain, using Redis as a
+// read-through cache backed by PostgreSQL.
+func (p *StaticPlugin) resolveSiteID(ctx context.Context, subdomain string) (string, error) {
+	redisKey := "site:" + subdomain
+
+	// 1. Redis cache lookup
+	if p.redisClient != nil {
+		val, err := p.redisClient.Get(ctx, redisKey).Result()
+		if err == nil {
+			// Cache hit
+			if val == "NOT_FOUND" {
+				return "", nil // tenant does not exist
+			}
+			return val, nil
+		}
+		if !errors.Is(err, redis.Nil) {
+			// Unexpected Redis error — log and fall through to DB
+			_ = err
+		}
+	}
+
+	// 2. PostgreSQL lookup
+	if p.db == nil {
+		return "", fmt.Errorf("static_s3: multi-tenant mode requires db_dsn")
+	}
+
+	var siteID string
+	row := p.db.QueryRowContext(ctx,
+		"SELECT id FROM sites WHERE subdomain = $1 AND active = true LIMIT 1",
+		subdomain,
+	)
+	err := row.Scan(&siteID)
+	if err != nil {
+		if errors.Is(err, errNoRows) {
+			// Tenant not found — cache negative result for 1 minute
+			if p.redisClient != nil {
+				_ = p.redisClient.Set(ctx, redisKey, "NOT_FOUND", 1*time.Minute).Err()
+			}
+			return "", nil
+		}
+		return "", fmt.Errorf("static_s3: db query error: %w", err)
+	}
+
+	// Cache the found site_id for 5 minutes
+	if p.redisClient != nil {
+		_ = p.redisClient.Set(ctx, redisKey, siteID, 5*time.Minute).Err()
+	}
+
+	return siteID, nil
+}
+
+// serveObjectWithCacheKey is a thin wrapper around serveObject that uses an
+// explicit cache key (e.g. "subdomain:s3key") instead of the raw S3 key, so
+// that cross-tenant cache collisions are impossible.
+func (p *StaticPlugin) serveObjectWithCacheKey(w http.ResponseWriter, r *http.Request, s3Key, cacheKey string, isFallback bool) error {
+	// 1. Check LRU cache (using the scoped cache key)
+	if p.cacheTTL > 0 && p.cache != nil {
+		if item, ok := p.cache.Get(cacheKey); ok {
+			if !item.Exists {
+				return fmt.Errorf("cached 404 for key: %s", s3Key)
+			}
+			if p.RedirectToS3 {
+				return p.redirectToS3(w, r, s3Key)
+			}
+			if p.checkConditionalHeaders(w, r, item) {
+				return nil
+			}
+			if item.Content != nil {
+				return p.serveCachedContent(w, r, item)
+			}
+		}
+	}
+
+	// 2. Redirect path
+	if p.RedirectToS3 {
+		headResult, err := p.s3Client.HeadObject(r.Context(), &s3.HeadObjectInput{
+			Bucket: aws.String(p.Bucket),
+			Key:    aws.String(s3Key),
+		})
+		if err != nil {
+			if p.isNotFoundError(err) && p.cacheTTL > 0 && p.cache != nil {
+				p.cache.Set(cacheKey, &CacheItem{Key: cacheKey, Exists: false}, 1*time.Minute)
+			}
+			return err
+		}
+		if p.cacheTTL > 0 && p.cache != nil {
+			etag := ""
+			if headResult.ETag != nil {
+				etag = *headResult.ETag
+			}
+			lastModified := time.Now()
+			if headResult.LastModified != nil {
+				lastModified = *headResult.LastModified
+			}
+			contentType := "application/octet-stream"
+			if headResult.ContentType != nil && *headResult.ContentType != "" {
+				contentType = *headResult.ContentType
+			}
+			p.cache.Set(cacheKey, &CacheItem{
+				Key:          cacheKey,
+				ETag:         etag,
+				LastModified: lastModified,
+				Size:         *headResult.ContentLength,
+				ContentType:  contentType,
+				Exists:       true,
+			}, p.cacheTTL)
+		}
+		return p.redirectToS3(w, r, s3Key)
+	}
+
+	// 3. Normal streaming / proxy path
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(p.Bucket),
+		Key:    aws.String(s3Key),
+	}
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		input.Range = aws.String(rangeHeader)
+	}
+	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" {
+		input.IfNoneMatch = aws.String(ifNoneMatch)
+	}
+	if ifModifiedSince := r.Header.Get("If-Modified-Since"); ifModifiedSince != "" {
+		if t, err := http.ParseTime(ifModifiedSince); err == nil {
+			input.IfModifiedSince = &t
+		}
+	}
+
+	result, err := p.s3Client.GetObject(r.Context(), input)
+	if err != nil {
+		if p.isNotModifiedError(err) {
+			if p.cacheTTL > 0 && p.cache != nil {
+				if item, ok := p.cache.Get(cacheKey); ok {
+					p.cache.Set(cacheKey, item, p.cacheTTL)
+				}
+			}
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		if p.isNotFoundError(err) && p.cacheTTL > 0 && p.cache != nil {
+			p.cache.Set(cacheKey, &CacheItem{Key: cacheKey, Exists: false}, 1*time.Minute)
+		}
+		return err
+	}
+	defer result.Body.Close()
+
+	// 4. Extract headers & metadata
+	etag := ""
+	if result.ETag != nil {
+		etag = *result.ETag
+	}
+	lastModified := time.Now()
+	if result.LastModified != nil {
+		lastModified = *result.LastModified
+	}
+	contentType := "application/octet-stream"
+	if result.ContentType != nil && *result.ContentType != "" {
+		contentType = *result.ContentType
+	} else {
+		contentType = mime.TypeByExtension(filepath.Ext(s3Key))
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+	}
+	isRangeResponse := result.ContentRange != nil && *result.ContentRange != ""
+	size := int64(0)
+	if result.ContentLength != nil {
+		size = *result.ContentLength
+	}
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+	}
+	w.Header().Set("Last-Modified", lastModified.UTC().Format(http.TimeFormat))
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Accept-Ranges", "bytes")
+	if isRangeResponse {
+		w.Header().Set("Content-Range", *result.ContentRange)
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// 5. Cache & stream
+	canCacheContent := p.cacheTTL > 0 && p.maxCacheSize > 0 && size <= p.maxCacheSize && !isRangeResponse
+	if canCacheContent {
+		data, readErr := io.ReadAll(result.Body)
+		if readErr != nil {
+			return readErr
+		}
+		p.cache.Set(cacheKey, &CacheItem{
+			Key:          cacheKey,
+			ETag:         etag,
+			LastModified: lastModified,
+			Size:         size,
+			ContentType:  contentType,
+			Content:      data,
+			Exists:       true,
+		}, p.cacheTTL)
+		_, writeErr := w.Write(data)
+		return writeErr
+	}
+	if p.cacheTTL > 0 && !isRangeResponse {
+		p.cache.Set(cacheKey, &CacheItem{
+			Key:          cacheKey,
+			ETag:         etag,
+			LastModified: lastModified,
+			Size:         size,
+			ContentType:  contentType,
+			Exists:       true,
+		}, p.cacheTTL)
+	}
+	_, writeErr := io.Copy(w, result.Body)
+	return writeErr
+}
+
+// splitHostPort splits host and port, tolerating missing port.
+func splitHostPort(hostport string) (host, port string, err error) {
+	host = hostport
+	if i := strings.LastIndex(hostport, ":"); i >= 0 {
+		// Only treat it as host:port if the part after ":" looks like a port number
+		possiblePort := hostport[i+1:]
+		allDigits := true
+		for _, c := range possiblePort {
+			if c < '0' || c > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits && len(possiblePort) > 0 {
+			host = hostport[:i]
+			port = possiblePort
+			return host, port, nil
+		}
+	}
+	return host, "", fmt.Errorf("no port")
+}
+
+// errNoRows is a package-level alias so handler.go does not import database/sql.
+var errNoRows = errSQLNoRows()
+
 
 // serveObject fetches the file from S3 (or cache) and writes it to the response writer, or redirects the client.
 func (p *StaticPlugin) serveObject(w http.ResponseWriter, r *http.Request, key string, isFallback bool) error {

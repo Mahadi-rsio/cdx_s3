@@ -1,19 +1,21 @@
 # Caddy static_s3 Plugin
 
-`static_s3` is a middleware plugin for Caddy v2 that serves static files directly from AWS S3 or any S3-compatible storage (like MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, or Google Cloud Storage). 
+`static_s3` is a middleware plugin for Caddy v2 that serves static files directly from AWS S3 or any S3-compatible storage (like MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, or Google Cloud Storage).
 
-It is designed for production environment efficiency, security, and scalability, featuring built-in streaming, caching, range requests, SPA routing, and support for AWS credentials chains.
+It is designed for production environment efficiency, security, and scalability, featuring built-in streaming, caching, range requests, SPA routing, **multi-tenant subdomain routing**, and support for AWS credentials chains.
 
 ---
 
 ## Key Features
 
+- **Multi-Tenant Subdomain Routing:** Route `tenant-a.cloudisy.com` → its own S3 directory, resolved via Redis cache + PostgreSQL. Zero per-tenant config — just insert a row.
 - **Universal S3 Compatibility:** Works with any S3-compliant storage by configuring custom endpoints and region settings.
 - **Memory-Efficient Streaming:** Streams files directly from S3 to the client. Never loads large files (e.g., video or large images) entirely into Caddy's memory, avoiding Out-Of-Memory (OOM) crashes.
 - **High-Performance Caching:** Features a thread-safe LRU Cache with configurable TTL:
   - Caches metadata (ETags, Last-Modified, size) to quickly respond to conditional client requests.
   - Caches actual file content for small files to completely bypass S3 API requests.
   - Caches missing files (negative caching) to prevent hammering S3 on recurrent 404s.
+  - In multi-tenant mode, cache keys are scoped per-tenant (`subdomain:s3key`) to prevent cross-tenant collisions.
 - **Standard Range Requests:** Supports streaming media ranges (`Content-Range` / `Accept-Ranges`) directly through S3 range headers.
 - **Ambient Credentials support:** Access keys and secret keys are optional. If omitted, the plugin defaults to standard AWS credentials chain (supports IAM Roles, EKS Service Accounts, ECS Tasks, EC2 Instance Profiles, or environment variables).
 - **Advanced SPA Routing:** Configurable Single Page Application (SPA) fallback (e.g., `index.html`) with customizable file extension exclusions (e.g., return a 404 instead of index.html if a `.png` or `.css` file is missing).
@@ -47,8 +49,19 @@ Add the `static_s3` directive inside your site block.
             # Default: true (for backward compatibility and MinIO compatibility)
             use_path_style true
 
+            # --- Multi-Tenant Settings ---
+            # Base domain for subdomain extraction (enables multi-tenant mode). (Optional)
+            # e.g. "cloudisy.com" → extracts "tenant-a" from "tenant-a.cloudisy.com"
+            base_domain "cloudisy.com"
+            
+            # PostgreSQL DSN for site_id lookups. Falls back to DATABASE_URL env var. (Optional)
+            db_dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+            
+            # Redis URL for site_id caching. Falls back to REDIS_URL env var. (Optional)
+            redis_url "redis://localhost:6379/0"
+
             # --- Routing & Paths ---
-            # Sub-folder prefix inside the S3 bucket to limit lookups. (Optional)
+            # Sub-folder prefix inside the S3 bucket (single-tenant mode only). (Optional)
             prefix "public/"
             
             # SPA fallback file. Default: "index.html". Use "none" to disable. (Optional)
@@ -81,6 +94,119 @@ Add the `static_s3` directive inside your site block.
             # Expiry time for pre-signed redirect URLs (e.g., 10m, 1h). Default: 15m. (Optional)
             presign_lifetime 15m
         }
+    }
+}
+```
+
+---
+
+## Multi-Tenant Mode
+
+When `base_domain` is set, the plugin switches into **multi-tenant mode**. Each unique subdomain is mapped to its own S3 directory via a UUID stored in PostgreSQL, with Redis acting as a read-through cache.
+
+### How a request is handled
+
+```
+tenant-a.cloudisy.com/about
+        │
+        ▼
+  1. Extract subdomain  →  "tenant-a"
+        │
+        ▼
+  2. Redis GET "site:tenant-a"
+       hit  → use cached UUID
+       miss → SELECT id FROM sites WHERE subdomain='tenant-a' AND active=true
+             → cache UUID in Redis (TTL 5 min)
+        │
+        ▼
+  3. Build S3 key  →  "{UUID}/about/index.html"
+        │
+        ▼
+  4. Serve from S3 (LRU cached as "tenant-a:{UUID}/about/index.html")
+```
+
+### PostgreSQL schema
+
+```sql
+CREATE TABLE sites (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    subdomain   TEXT NOT NULL UNIQUE,
+    active      BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_sites_subdomain ON sites(subdomain);
+```
+
+### S3 directory structure
+
+Each tenant's files must live under their `site_id` UUID as the root prefix:
+
+```
+my-bucket/
+├── 550e8400-e29b-41d4-a716-446655440000/   ← tenant-a's UUID
+│   ├── index.html
+│   ├── about/index.html
+│   └── assets/app.css
+└── 6ba7b810-9dad-11d1-80b4-00c04fd430c8/   ← tenant-b's UUID
+    ├── index.html
+    └── blog/index.html
+```
+
+### Redis cache behaviour
+
+| Scenario | Redis key | Value | TTL |
+|---|---|---|---|
+| Tenant found | `site:tenant-a` | UUID string | 5 min |
+| Tenant not found | `site:ghost` | `NOT_FOUND` | 1 min |
+
+### Managing tenants
+
+```bash
+# Add a new tenant
+psql -c "INSERT INTO sites (subdomain) VALUES ('tenant-a');"
+
+# Disable a tenant immediately
+psql -c "UPDATE sites SET active=false WHERE subdomain='tenant-a';"
+redis-cli DEL site:tenant-a
+
+# Force cache refresh (e.g. after re-enabling a tenant)
+redis-cli DEL site:tenant-a
+```
+
+### Environment variables (multi-tenant)
+
+| Variable | Caddyfile equivalent | Description |
+|---|---|---|
+| `BASE_DOMAIN` | `base_domain` | Base domain for subdomain extraction |
+| `DATABASE_URL` | `db_dsn` | PostgreSQL connection string |
+| `REDIS_URL` | `redis_url` | Redis connection URL |
+| `S3_ACCESS_KEY` | `access_key` | S3 access key |
+| `S3_SECRET_KEY` | `secret_key` | S3 secret key |
+
+### Full multi-tenant Caddyfile example
+
+```caddy
+{
+    order static_s3 before respond
+}
+
+*.cloudisy.com {
+    static_s3 {
+        endpoint        https://s3.dianahost.com
+        bucket          cloudisy-sites
+        access_key      {env.S3_ACCESS_KEY}
+        secret_key      {env.S3_SECRET_KEY}
+        use_path_style  true
+
+        base_domain     cloudisy.com
+        db_dsn          {env.DATABASE_URL}
+        redis_url       {env.REDIS_URL}
+
+        cache_ttl       10m
+        cache_size      2000
+        max_cache_size  5MB
+        fallback_except png css js svg ico woff woff2 ttf map
     }
 }
 ```
@@ -156,9 +282,10 @@ static_s3 {
 ├── go.sum             # Go dependencies checksum file
 ├── cache.go           # LRU cache implementation with TTL
 ├── cache_test.go      # LRU cache unit tests
-├── handler.go         # Core middleware, S3 requests, and streaming logic
-├── plugin.go          # Caddy registration & configuration parser
+├── handler.go         # Core middleware, S3 requests, multi-tenant routing, and streaming logic
+├── plugin.go          # Caddy registration, configuration parser, PostgreSQL & Redis setup
 ├── plugin_test.go     # Plugin & parser unit tests
+├── sql_helpers.go     # Internal sql.ErrNoRows bridge
 └── README.md          # Project documentation
 ```
 
@@ -174,9 +301,14 @@ go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 ```
 
 ### Building Caddy with the Plugin
-Build locally:
 ```bash
-xcaddy build --with github.com/Mahadi-rsio/cdx_s3=.
+xcaddy build --with github.com/Mahadi-rsio/cdx_s3=. --output ./caddy
+```
+
+### Verify the plugin is embedded
+```bash
+./caddy list-modules | grep static_s3
+# http.handlers.static_s3
 ```
 
 ---

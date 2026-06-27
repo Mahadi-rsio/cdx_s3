@@ -1,6 +1,8 @@
 package cdx_s3
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"time"
@@ -9,12 +11,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/dustin/go-humanize"
+	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 func init() {
@@ -42,12 +45,19 @@ type StaticPlugin struct {
 	PresignRedirect    bool   `json:"presign_redirect,omitempty"`
 	PresignLifetimeStr string `json:"presign_lifetime,omitempty"`
 
+	// Multi-tenant fields
+	BaseDomain string `json:"base_domain,omitempty"`
+	DBDSN      string `json:"db_dsn,omitempty"`
+	RedisURL   string `json:"redis_url,omitempty"`
+
 	s3Client        *s3.Client
 	s3PresignClient *s3.PresignClient
 	cache           *LRUCache
 	cacheTTL        time.Duration
 	maxCacheSize    int64
 	presignLifetime time.Duration
+	db              *sql.DB
+	redisClient     *redis.Client
 }
 
 func (StaticPlugin) CaddyModule() caddy.ModuleInfo {
@@ -78,7 +88,48 @@ func (p *StaticPlugin) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	// SPA Fallback setup: default to "index.html". Can be disabled by setting fallback to "none" or ""
+	// Multi-tenant: environment variable fallbacks
+	if p.BaseDomain == "" {
+		p.BaseDomain = os.Getenv("BASE_DOMAIN")
+	}
+	if p.DBDSN == "" {
+		p.DBDSN = os.Getenv("DATABASE_URL")
+	}
+	if p.RedisURL == "" {
+		p.RedisURL = os.Getenv("REDIS_URL")
+	}
+
+	// Open PostgreSQL connection if multi-tenant mode is configured
+	if p.BaseDomain != "" && p.DBDSN != "" {
+		db, err := sql.Open("postgres", p.DBDSN)
+		if err != nil {
+			return fmt.Errorf("static_s3: failed to open postgres: %w", err)
+		}
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := db.PingContext(pingCtx); err != nil {
+			return fmt.Errorf("static_s3: postgres ping failed: %w", err)
+		}
+		p.db = db
+	}
+
+	// Open Redis connection if multi-tenant mode is configured
+	if p.BaseDomain != "" && p.RedisURL != "" {
+		opts, err := redis.ParseURL(p.RedisURL)
+		if err != nil {
+			return fmt.Errorf("static_s3: invalid redis_url: %w", err)
+		}
+		rdb := redis.NewClient(opts)
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := rdb.Ping(pingCtx).Err(); err != nil {
+			return fmt.Errorf("static_s3: redis ping failed: %w", err)
+		}
+		p.redisClient = rdb
+	}
+
+	// SPA Fallback: hardcoded to "index.html" in multi-tenant mode.
+	// Can be disabled by setting fallback to "none" or "" in single-tenant mode.
 	if p.Fallback == "" {
 		p.Fallback = "index.html"
 	} else if p.Fallback == "none" || p.Fallback == `""` || p.Fallback == `''` {
@@ -246,6 +297,21 @@ func (p *StaticPlugin) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				p.PresignLifetimeStr = d.Val()
+			case "base_domain":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.BaseDomain = d.Val()
+			case "db_dsn":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.DBDSN = d.Val()
+			case "redis_url":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.RedisURL = d.Val()
 			default:
 				return d.Errf("unknown subdirective: %s", d.Val())
 			}
