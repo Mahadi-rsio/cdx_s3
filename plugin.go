@@ -1,14 +1,8 @@
 package cdx_s3
 
 import (
-	"bytes"
 	"fmt"
-	"io"
-	"mime"
-	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,7 +14,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	_ "github.com/caddyserver/caddy/v2/modules/standard"
+	"github.com/dustin/go-humanize"
 )
 
 func init() {
@@ -29,13 +23,25 @@ func init() {
 }
 
 type StaticPlugin struct {
-	Endpoint  string `json:"endpoint"`
-	Bucket    string `json:"bucket"`
-	AccessKey string `json:"access_key"`
-	SecretKey string `json:"secret_key"`
-	Region    string `json:"region"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	Bucket       string `json:"bucket"`
+	AccessKey    string `json:"access_key,omitempty"`
+	SecretKey    string `json:"secret_key,omitempty"`
+	Region       string `json:"region,omitempty"`
+	UsePathStyle *bool  `json:"use_path_style,omitempty"`
 
-	s3Client *s3.Client
+	Prefix         string   `json:"prefix,omitempty"`
+	Fallback       string   `json:"fallback,omitempty"`
+	FallbackExcept []string `json:"fallback_except,omitempty"`
+
+	CacheTTL     string `json:"cache_ttl,omitempty"`
+	CacheSize    int    `json:"cache_size,omitempty"`
+	MaxCacheSize string `json:"max_cache_size,omitempty"`
+
+	s3Client     *s3.Client
+	cache        *LRUCache
+	cacheTTL     time.Duration
+	maxCacheSize int64
 }
 
 func (StaticPlugin) CaddyModule() caddy.ModuleInfo {
@@ -46,7 +52,7 @@ func (StaticPlugin) CaddyModule() caddy.ModuleInfo {
 }
 
 func (p *StaticPlugin) Provision(ctx caddy.Context) error {
-	// এনভায়রনমেন্ট ভেরিয়েবল থেকে ক্রেডেনশিয়াল নেওয়া (যদি Caddyfile-এ না থাকে)
+	// Fallbacks / Environment Variables
 	if p.AccessKey == "" {
 		p.AccessKey = os.Getenv("S3_ACCESS_KEY")
 	}
@@ -54,83 +60,80 @@ func (p *StaticPlugin) Provision(ctx caddy.Context) error {
 		p.SecretKey = os.Getenv("S3_SECRET_KEY")
 	}
 	if p.Region == "" {
-		p.Region = "us-east-1"
+		p.Region = os.Getenv("S3_REGION")
+		if p.Region == "" {
+			p.Region = "us-east-1"
+		}
+	}
+	if p.Bucket == "" {
+		p.Bucket = os.Getenv("S3_BUCKET")
+		if p.Bucket == "" {
+			return fmt.Errorf("static_s3: bucket name must be configured")
+		}
 	}
 
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(p.Region),
-		config.WithCredentialsProvider(
+	// SPA Fallback setup: default to "index.html". Can be disabled by setting fallback to "none" or ""
+	if p.Fallback == "" {
+		p.Fallback = "index.html"
+	} else if p.Fallback == "none" || p.Fallback == `""` || p.Fallback == `''` {
+		p.Fallback = ""
+	}
+
+	// Build AWS configuration options
+	var opts []func(*config.LoadOptions) error
+	opts = append(opts, config.WithRegion(p.Region))
+
+	// Only use static credentials provider if access_key or secret_key is specified.
+	// Otherwise, it falls back to AWS default credentials chain (env vars, ECS/EKS/EC2 IAM Roles).
+	if p.AccessKey != "" || p.SecretKey != "" {
+		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(p.AccessKey, p.SecretKey, ""),
-		),
-	)
+		))
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("static_s3: aws config failed: %w", err)
 	}
 
-	// MinIO/S3 এর জন্য ক্লায়েন্ট তৈরি
+	// Initialize S3 Client
 	p.s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(p.Endpoint)
-		o.UsePathStyle = true
-	})
-
-	return nil
-}
-
-func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	path := r.URL.Path
-	
-	// SPA রাউটিং: রুট পাথ অথবা কোনো এক্সটেনশন ছাড়া পাথ হলে index.html দেখাবে
-	if path == "/" || path == "" || !hasExtension(path) {
-		return p.serveObject(w, r, "index.html")
-	}
-	
-	return p.serveObject(w, r, strings.TrimPrefix(path, "/"))
-}
-
-func (p *StaticPlugin) serveObject(w http.ResponseWriter, r *http.Request, key string) error {
-	result, err := p.s3Client.GetObject(r.Context(), &s3.GetObjectInput{
-		Bucket: aws.String(p.Bucket),
-		Key:    aws.String(key),
-	})
-
-	if err != nil {
-		// ফাইল না পেলে SPA এর জন্য index.html এ ফলব্যাক
-		if key != "index.html" && (strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "404")) {
-			return p.serveObject(w, r, "index.html")
+		if p.Endpoint != "" {
+			o.BaseEndpoint = aws.String(p.Endpoint)
 		}
-		return caddyhttp.Error(http.StatusNotFound, err)
-	}
-	defer result.Body.Close()
+		if p.UsePathStyle != nil {
+			o.UsePathStyle = *p.UsePathStyle
+		} else {
+			o.UsePathStyle = true // Backward-compatible default
+		}
+	})
 
-	// S3 এর Body (io.ReadCloser) কে মেমোরিতে এনে bytes.Reader (io.ReadSeeker) বানানো
-	data, err := io.ReadAll(result.Body)
-	if err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError, err)
-	}
-	reader := bytes.NewReader(data)
-
-	// MIME টাইপ নির্ধারণ
-	contentType := "application/octet-stream"
-	if result.ContentType != nil {
-		contentType = *result.ContentType
-	} else {
-		contentType = mime.TypeByExtension(filepath.Ext(key))
-	}
-	w.Header().Set("Content-Type", contentType)
-
-	// Last-Modified টাইম সেট করা (যদি S3 তে না থাকে তবে বর্তমান সময়)
-	lastModified := time.Now()
-	if result.LastModified != nil {
-		lastModified = *result.LastModified
+	// Parse Caching configs
+	if p.CacheTTL != "" {
+		ttl, err := caddy.ParseDuration(p.CacheTTL)
+		if err != nil {
+			return fmt.Errorf("static_s3: invalid cache_ttl: %w", err)
+		}
+		p.cacheTTL = ttl
 	}
 
-	// Range request সাপোর্ট সহ ফাইল সার্ভ করা
-	http.ServeContent(w, r, key, lastModified, reader)
+	if p.MaxCacheSize != "" {
+		bytesVal, err := humanize.ParseBytes(p.MaxCacheSize)
+		if err != nil {
+			return fmt.Errorf("static_s3: invalid max_cache_size: %w", err)
+		}
+		p.maxCacheSize = int64(bytesVal)
+	}
+
+	if p.cacheTTL > 0 {
+		size := p.CacheSize
+		if size <= 0 {
+			size = 1000 // Default cache capacity
+		}
+		p.cache = NewLRUCache(size)
+	}
+
 	return nil
-}
-
-func hasExtension(path string) bool {
-	return filepath.Ext(path) != ""
 }
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
@@ -168,10 +171,50 @@ func (p *StaticPlugin) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				p.Region = d.Val()
+			case "use_path_style":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val := d.Val() == "true" || d.Val() == "yes" || d.Val() == "on"
+				p.UsePathStyle = &val
+			case "prefix":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.Prefix = d.Val()
+			case "fallback":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.Fallback = d.Val()
+			case "fallback_except":
+				p.FallbackExcept = d.RemainingArgs()
+				if len(p.FallbackExcept) == 0 {
+					return d.ArgErr()
+				}
+			case "cache_ttl":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.CacheTTL = d.Val()
+			case "cache_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				var val int
+				if _, err := fmt.Sscan(d.Val(), &val); err != nil {
+					return d.Errf("invalid cache_size: %v", err)
+				}
+				p.CacheSize = val
+			case "max_cache_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.MaxCacheSize = d.Val()
+			default:
+				return d.Errf("unknown subdirective: %s", d.Val())
 			}
 		}
 	}
 	return nil
 }
-
-
