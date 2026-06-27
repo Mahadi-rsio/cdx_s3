@@ -38,10 +38,16 @@ type StaticPlugin struct {
 	CacheSize    int    `json:"cache_size,omitempty"`
 	MaxCacheSize string `json:"max_cache_size,omitempty"`
 
-	s3Client     *s3.Client
-	cache        *LRUCache
-	cacheTTL     time.Duration
-	maxCacheSize int64
+	RedirectToS3       bool   `json:"redirect_to_s3,omitempty"`
+	PresignRedirect    bool   `json:"presign_redirect,omitempty"`
+	PresignLifetimeStr string `json:"presign_lifetime,omitempty"`
+
+	s3Client        *s3.Client
+	s3PresignClient *s3.PresignClient
+	cache           *LRUCache
+	cacheTTL        time.Duration
+	maxCacheSize    int64
+	presignLifetime time.Duration
 }
 
 func (StaticPlugin) CaddyModule() caddy.ModuleInfo {
@@ -133,6 +139,20 @@ func (p *StaticPlugin) Provision(ctx caddy.Context) error {
 		p.cache = NewLRUCache(size)
 	}
 
+	// Initialize S3 Presign Client if redirect and presign are enabled
+	if p.RedirectToS3 && p.PresignRedirect {
+		p.s3PresignClient = s3.NewPresignClient(p.s3Client)
+		if p.PresignLifetimeStr != "" {
+			lifetime, err := caddy.ParseDuration(p.PresignLifetimeStr)
+			if err != nil {
+				return fmt.Errorf("static_s3: invalid presign_lifetime: %w", err)
+			}
+			p.presignLifetime = lifetime
+		} else {
+			p.presignLifetime = 15 * time.Minute // Default pre-signed URL validity
+		}
+	}
+
 	return nil
 }
 
@@ -211,6 +231,21 @@ func (p *StaticPlugin) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				p.MaxCacheSize = d.Val()
+			case "redirect_to_s3":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.RedirectToS3 = d.Val() == "true" || d.Val() == "yes" || d.Val() == "on"
+			case "presign_redirect":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.PresignRedirect = d.Val() == "true" || d.Val() == "yes" || d.Val() == "on"
+			case "presign_lifetime":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				p.PresignLifetimeStr = d.Val()
 			default:
 				return d.Errf("unknown subdirective: %s", d.Val())
 			}

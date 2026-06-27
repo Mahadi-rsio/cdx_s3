@@ -58,6 +58,22 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 			},
 			shouldErr: false,
 		},
+		{
+			name: "redirect options",
+			input: `static_s3 {
+				bucket my-bucket
+				redirect_to_s3 true
+				presign_redirect true
+				presign_lifetime 10m
+			}`,
+			expected: StaticPlugin{
+				Bucket:             "my-bucket",
+				RedirectToS3:       true,
+				PresignRedirect:    true,
+				PresignLifetimeStr: "10m",
+			},
+			shouldErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -104,6 +120,15 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 				}
 				if p.MaxCacheSize != tt.expected.MaxCacheSize {
 					t.Errorf("MaxCacheSize: expected %q, got %q", tt.expected.MaxCacheSize, p.MaxCacheSize)
+				}
+				if p.RedirectToS3 != tt.expected.RedirectToS3 {
+					t.Errorf("RedirectToS3: expected %v, got %v", tt.expected.RedirectToS3, p.RedirectToS3)
+				}
+				if p.PresignRedirect != tt.expected.PresignRedirect {
+					t.Errorf("PresignRedirect: expected %v, got %v", tt.expected.PresignRedirect, p.PresignRedirect)
+				}
+				if p.PresignLifetimeStr != tt.expected.PresignLifetimeStr {
+					t.Errorf("PresignLifetimeStr: expected %q, got %q", tt.expected.PresignLifetimeStr, p.PresignLifetimeStr)
 				}
 			}
 		})

@@ -68,10 +68,39 @@ Add the `static_s3` directive inside your site block.
             # Supports human-readable formats (e.g., 512KiB, 2MB).
             # If a file is larger than this, only its metadata is cached.
             max_cache_size 512KiB
+
+            # --- Bandwidth Optimization (S3 Redirection) ---
+            # Redirect the client directly to the S3 bucket URL to bypass VPS network bandwidth. (Optional)
+            # Default: false
+            redirect_to_s3 true
+
+            # Generate a temporary pre-signed URL for redirects to keep private buckets secure. (Optional)
+            # Default: false (requires redirect_to_s3 to be true)
+            presign_redirect true
+
+            # Expiry time for pre-signed redirect URLs (e.g., 10m, 1h). Default: 15m. (Optional)
+            presign_lifetime 15m
         }
     }
 }
 ```
+
+---
+
+## 🚀 S3 Redirection (Bandwidth Optimization / BDIX)
+
+For platforms with high traffic or hosting massive static media files, routing all traffic through your VPS can consume excessive bandwidth and cause latency.
+
+By enabling `redirect_to_s3 true`, Caddy will:
+1. Validate the file existence locally (checking the cache or running a cheap `HeadObject` request).
+2. Catch missing files and run local SPA index fallback routing.
+3. Redirect the client's browser (HTTP `307 Temporary Redirect`) directly to the S3 provider.
+
+This shifts **100% of the download bandwidth** to your S3 provider. If your S3 provider has unlimited bandwidth (e.g., via BDIX or direct peering), this results in completely free egress and high download speeds while keeping VPS resource usage at zero.
+
+### Private Buckets Security
+If your S3 bucket is private, enable `presign_redirect true`. Caddy will generate a temporary pre-signed S3 URL on the fly (locally, using your access/secret keys with no S3 API network calls) and redirect the client to that secure URL.
+
 
 ---
 

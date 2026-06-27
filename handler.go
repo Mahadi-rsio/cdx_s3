@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -53,13 +54,18 @@ func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	return nil
 }
 
-// serveObject fetches the file from S3 (or cache) and writes it to the response writer.
+// serveObject fetches the file from S3 (or cache) and writes it to the response writer, or redirects the client.
 func (p *StaticPlugin) serveObject(w http.ResponseWriter, r *http.Request, key string, isFallback bool) error {
 	// 1. Check Cache first (if enabled)
 	if p.cacheTTL > 0 && p.cache != nil {
 		if item, ok := p.cache.Get(key); ok {
 			if !item.Exists {
 				return fmt.Errorf("cached 404 for key: %s", key)
+			}
+
+			// If redirection is enabled, redirect directly to S3 since we verified the key exists
+			if p.RedirectToS3 {
+				return p.redirectToS3(w, r, key)
 			}
 
 			// Validate conditional headers against cached metadata
@@ -74,7 +80,51 @@ func (p *StaticPlugin) serveObject(w http.ResponseWriter, r *http.Request, key s
 		}
 	}
 
-	// 2. Build S3 GetObject Input
+	// 2. Handle S3 Redirection path (avoids downloading file body)
+	if p.RedirectToS3 {
+		// Verify if the key actually exists in S3 before redirecting (important for SPA fallbacks)
+		headResult, err := p.s3Client.HeadObject(r.Context(), &s3.HeadObjectInput{
+			Bucket: aws.String(p.Bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			if p.isNotFoundError(err) {
+				if p.cacheTTL > 0 && p.cache != nil {
+					// Cache the negative lookup for 1 minute
+					p.cache.Set(key, &CacheItem{Key: key, Exists: false}, 1*time.Minute)
+				}
+			}
+			return err
+		}
+
+		// Cache file metadata
+		if p.cacheTTL > 0 && p.cache != nil {
+			etag := ""
+			if headResult.ETag != nil {
+				etag = *headResult.ETag
+			}
+			lastModified := time.Now()
+			if headResult.LastModified != nil {
+				lastModified = *headResult.LastModified
+			}
+			contentType := "application/octet-stream"
+			if headResult.ContentType != nil && *headResult.ContentType != "" {
+				contentType = *headResult.ContentType
+			}
+			p.cache.Set(key, &CacheItem{
+				Key:          key,
+				ETag:         etag,
+				LastModified: lastModified,
+				Size:         *headResult.ContentLength,
+				ContentType:  contentType,
+				Exists:       true,
+			}, p.cacheTTL)
+		}
+
+		return p.redirectToS3(w, r, key)
+	}
+
+	// 3. Normal streaming / proxy path
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(p.Bucket),
 		Key:    aws.String(key),
@@ -95,7 +145,7 @@ func (p *StaticPlugin) serveObject(w http.ResponseWriter, r *http.Request, key s
 		}
 	}
 
-	// 3. Request object from S3
+	// Request object from S3
 	result, err := p.s3Client.GetObject(r.Context(), input)
 	if err != nil {
 		// Handle 304 Not Modified from S3
@@ -209,6 +259,44 @@ func (p *StaticPlugin) serveObject(w http.ResponseWriter, r *http.Request, key s
 	// Stream file to response writer (uses constant memory buffer)
 	_, writeErr := io.Copy(w, result.Body)
 	return writeErr
+}
+
+// redirectToS3 redirects the client to the S3 URL (optionally pre-signed).
+func (p *StaticPlugin) redirectToS3(w http.ResponseWriter, r *http.Request, key string) error {
+	var redirectURL string
+
+	if p.PresignRedirect && p.s3PresignClient != nil {
+		// Generate pre-signed URL (local operation)
+		presignedReq, err := p.s3PresignClient.PresignGetObject(r.Context(), &s3.GetObjectInput{
+			Bucket: aws.String(p.Bucket),
+			Key:    aws.String(key),
+		}, func(opts *s3.PresignOptions) {
+			opts.Expires = p.presignLifetime
+		})
+		if err != nil {
+			return fmt.Errorf("failed to presign s3 redirect URL: %w", err)
+		}
+		redirectURL = presignedReq.URL
+	} else {
+		// Format S3 public URL
+		if p.Endpoint != "" {
+			if p.UsePathStyle != nil && *p.UsePathStyle {
+				redirectURL = fmt.Sprintf("%s/%s/%s", strings.TrimSuffix(p.Endpoint, "/"), p.Bucket, key)
+			} else {
+				u, err := url.Parse(p.Endpoint)
+				if err == nil {
+					redirectURL = fmt.Sprintf("%s://%s.%s/%s", u.Scheme, p.Bucket, u.Host, key)
+				} else {
+					redirectURL = fmt.Sprintf("%s/%s/%s", strings.TrimSuffix(p.Endpoint, "/"), p.Bucket, key)
+				}
+			}
+		} else {
+			redirectURL = fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", p.Bucket, p.Region, key)
+		}
+	}
+
+	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+	return nil
 }
 
 // checkConditionalHeaders checks client headers against cached item. Returns true if 304 served.
