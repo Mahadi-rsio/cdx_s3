@@ -21,10 +21,10 @@
 
     handle @media {
         static_s3 {
-            endpoint       http://localhost:9000
+            endpoint       http://103.71.47.72:9000
             bucket         cdx
-            access_key     admin
-            secret_key     StrongPassword123
+            access_key     minioadmin
+            secret_key     minioadmin
             
             # Redirect media directly to S3
             redirect_to_s3   true
@@ -36,11 +36,17 @@
     # Fallback handler for HTML, CSS, JS, etc. (cached locally on VPS)
     handle {
         static_s3 {
-            endpoint       http://localhost:9000
+            endpoint       http://103.71.47.72:9000
             bucket         cdx
-            access_key     admin
-            secret_key     StrongPassword123
+            access_key     minioadmin
+            secret_key     minioadmin
             
+            db_dsn         "postgresql://neondb_owner:npg_BNarY7EcWZT8@ep-cold-star-aormfraw-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+            redis_url      "redis://localhost:6379"
+            base_domain    "localhost"
+
+
             # Serve directly from Caddy (no redirection)
             redirect_to_s3   false
             
