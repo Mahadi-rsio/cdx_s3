@@ -1,5 +1,5 @@
 {
-    
+    auto_https off
     order static_s3 before respond
 }
 
@@ -21,31 +21,40 @@
 
     handle @media {
         static_s3 {
-            endpoint       http://103.71.47.72:9000
-            bucket         cdx
-            access_key     minioadmin
-            secret_key     minioadmin
-            
+            endpoint        http://minio:9000
+            bucket          cloudisy-sites
+            access_key      minioadmin
+            secret_key      minioadmin
+            use_path_style  true
+
+            # Multi-tenant context config
+            base_domain     localhost
+            db_dsn          "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
+            redis_url       "redis://redis:6379/0"
+
             # Redirect media directly to S3
             redirect_to_s3   true
             presign_redirect true
             presign_lifetime 15m
+            
+            # SPA fallback options
+            fallback_except png css js svg ico woff woff2 ttf map
         }
     }
 
     # Fallback handler for HTML, CSS, JS, etc. (cached locally on VPS)
     handle {
         static_s3 {
-            endpoint       http://103.71.47.72:9000
-            bucket         cdx
-            access_key     minioadmin
-            secret_key     minioadmin
-            
-            db_dsn         "postgresql://neondb_owner:npg_BNarY7EcWZT8@ep-cold-star-aormfraw-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+            endpoint        http://minio:9000
+            bucket          cloudisy-sites
+            access_key      minioadmin
+            secret_key      minioadmin
+            use_path_style  true
 
-            redis_url      "redis://localhost:6379"
-            base_domain    "localhost"
-
+            # Multi-tenant config
+            base_domain     localhost
+            db_dsn          "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
+            redis_url       "redis://redis:6379/0"
 
             # Serve directly from Caddy (no redirection)
             redirect_to_s3   false
@@ -54,7 +63,9 @@
             cache_ttl      2m
             cache_size     1000
             max_cache_size 512KiB
+            
+            # SPA fallback options
+            fallback_except png css js svg ico woff woff2 ttf map
         }
     }
 }
-
