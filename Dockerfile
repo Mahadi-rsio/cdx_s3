@@ -1,8 +1,12 @@
 # Stage 1: Build Caddy with the custom plugin
 FROM caddy:2.11.4-builder AS builder
 
-# Copy the plugin source code into the builder
+# Copy go.mod and go.sum first to cache dependency downloads
 WORKDIR /src/cdx_s3
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source code
 COPY . .
 
 # Build Caddy with the local plugin source
@@ -14,3 +18,4 @@ FROM caddy:2.11.4-alpine
 
 # Copy the custom-built Caddy binary from the builder
 COPY --from=builder /src/cdx_s3/caddy /usr/bin/caddy
+

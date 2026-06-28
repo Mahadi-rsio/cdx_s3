@@ -16,9 +16,11 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable
       - REDIS_URL=redis://redis:6379/0
     depends_on:
-      - postgres
-      - redis
-      - minio
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: always
 
   # Local S3 simulation
   minio:
@@ -43,6 +45,12 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
 
   # Redis Cache for tenant lookups
   redis:
