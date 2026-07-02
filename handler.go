@@ -72,15 +72,38 @@ func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		// 5. Scope LRU cache key per tenant to avoid cross-tenant collisions
 		cacheKey := subdomain + ":" + s3Key
 
-		err = p.serveObjectWithCacheKey(w, r, s3Key, cacheKey, isFallbackRequest)
+		// Wrap response writer to capture status code and bytes written for
+		// analytics — the recorder is transparent to the caller.
+		rec := caddyhttp.NewResponseRecorder(w, nil, nil)
+
+		err = p.serveObjectWithCacheKey(rec, r, s3Key, cacheKey, isFallbackRequest)
 		if err != nil {
 			if p.Fallback != "" && !isFallbackRequest && p.isNotFoundError(err) && !p.isExcludedFromFallback(urlPath) {
 				fallbackKey := siteID + "/index.html"
 				fallbackCacheKey := subdomain + ":" + fallbackKey
-				return p.serveObjectWithCacheKey(w, r, fallbackKey, fallbackCacheKey, true)
+				return p.serveObjectWithCacheKey(rec, r, fallbackKey, fallbackCacheKey, true)
 			}
 			return caddyhttp.Error(http.StatusNotFound, err)
 		}
+
+		// Flush buffered response to client before recording analytics.
+		rec.WriteResponse()
+
+		// Non-blocking analytics record — never delays the HTTP response.
+		if p.analytics != nil {
+			ip := r.RemoteAddr
+			if idx := strings.LastIndex(ip, ":"); idx != -1 {
+				ip = ip[:idx]
+			}
+			p.analytics.Record(
+				siteID,
+				rec.Status(),
+				int64(rec.Size()),
+				r.Header.Get("User-Agent"),
+				ip,
+			)
+		}
+
 		return nil
 	}
 
