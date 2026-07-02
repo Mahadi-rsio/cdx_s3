@@ -29,7 +29,7 @@ type analyticsEvent struct {
 type AnalyticsMiddleware struct {
 	redis      *redis.Client
 	db         *sql.DB
-	eventCh    chan analyticsEvent // buffered channel, capacity 2048
+	eventCh    chan analyticsEvent // buffered channel, capacity 100000 for high burst absorption
 	flushEvery time.Duration       // default: 5 minutes
 	done       chan struct{}        // graceful-shutdown signal
 	wg         sync.WaitGroup      // wait for goroutines to exit
@@ -40,7 +40,7 @@ func NewAnalyticsMiddleware(redisClient *redis.Client, db *sql.DB) *AnalyticsMid
 	a := &AnalyticsMiddleware{
 		redis:      redisClient,
 		db:         db,
-		eventCh:    make(chan analyticsEvent, 2048),
+		eventCh:    make(chan analyticsEvent, 100000), // scaled to 100,000 slots
 		flushEvery: 5 * time.Minute,
 		done:       make(chan struct{}),
 	}
@@ -48,35 +48,38 @@ func NewAnalyticsMiddleware(redisClient *redis.Client, db *sql.DB) *AnalyticsMid
 	return a
 }
 
-// start launches exactly two background goroutines:
+// start launches background goroutines:
 //
-//  1. Event worker — drains the channel and writes Redis counters via Pipeline.
-//  2. Flusher      — ticks every flushEvery, reads Redis → upserts PostgreSQL.
+//  1. 10 Event workers — drains the channel in parallel and writes Redis counters.
+//  2. 1 Flusher        — ticks every flushEvery, reads Redis → upserts PostgreSQL.
 func (a *AnalyticsMiddleware) start() {
-	// ── Goroutine 1: Event worker ─────────────────────────────────────────
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		for {
-			select {
-			case event := <-a.eventCh:
-				a.processEvent(event)
-			case <-a.done:
-				// Drain remaining events before exiting so we don't lose data
-				// that arrived between the shutdown signal and now.
-				for {
-					select {
-					case event := <-a.eventCh:
-						a.processEvent(event)
-					default:
-						return
+	// ── Goroutines Group 1: 10 Event workers ──────────────────────────────
+	numWorkers := 10
+	for i := 0; i < numWorkers; i++ {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			for {
+				select {
+				case event := <-a.eventCh:
+					a.processEvent(event)
+				case <-a.done:
+					// Drain remaining events before exiting so we don't lose data
+					// that arrived between the shutdown signal and now.
+					for {
+						select {
+						case event := <-a.eventCh:
+							a.processEvent(event)
+						default:
+							return
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 
-	// ── Goroutine 2: Flusher ──────────────────────────────────────────────
+	// ── Goroutine Group 2: Flusher ────────────────────────────────────────
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
