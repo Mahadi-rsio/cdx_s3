@@ -6,7 +6,7 @@ import (
 )
 
 func TestLRUCache_Basic(t *testing.T) {
-	c := NewLRUCache(2)
+	c := NewLRUCache(2, 0)
 
 	// Get missing key
 	if _, ok := c.Get("foo"); ok {
@@ -50,7 +50,7 @@ func TestLRUCache_Basic(t *testing.T) {
 }
 
 func TestLRUCache_Expiration(t *testing.T) {
-	c := NewLRUCache(2)
+	c := NewLRUCache(2, 0)
 	item := &CacheItem{
 		Key:    "expire-me",
 		Exists: true,
@@ -72,7 +72,7 @@ func TestLRUCache_Expiration(t *testing.T) {
 }
 
 func TestLRUCache_Eviction(t *testing.T) {
-	c := NewLRUCache(2)
+	c := NewLRUCache(2, 0)
 
 	c.Set("k1", &CacheItem{Key: "k1", Exists: true}, 1*time.Minute)
 	c.Set("k2", &CacheItem{Key: "k2", Exists: true}, 1*time.Minute)
@@ -96,19 +96,21 @@ func TestLRUCache_Eviction(t *testing.T) {
 	}
 }
 
-func TestLRUCache_DeleteAndClear(t *testing.T) {
-	c := NewLRUCache(5)
+func TestLRUCache_DeleteByPrefix(t *testing.T) {
+	c := NewLRUCache(5, 0)
 
-	c.Set("k1", &CacheItem{Key: "k1", Exists: true}, 1*time.Minute)
-	c.Set("k2", &CacheItem{Key: "k2", Exists: true}, 1*time.Minute)
+	c.Set("tenant-a:foo", &CacheItem{Key: "tenant-a:foo", Exists: true}, 1*time.Minute)
+	c.Set("tenant-a:bar", &CacheItem{Key: "tenant-a:bar", Exists: true}, 1*time.Minute)
+	c.Set("tenant-b:baz", &CacheItem{Key: "tenant-b:baz", Exists: true}, 1*time.Minute)
 
-	c.Delete("k1")
-	if _, ok := c.Get("k1"); ok {
-		t.Fatal("expected k1 to be deleted")
+	c.DeleteByPrefix("tenant-a:")
+	if _, ok := c.Get("tenant-a:foo"); ok {
+		t.Fatal("expected tenant-a:foo to be deleted")
 	}
-
-	c.Clear()
-	if _, ok := c.Get("k2"); ok {
-		t.Fatal("expected cache to be cleared")
+	if _, ok := c.Get("tenant-a:bar"); ok {
+		t.Fatal("expected tenant-a:bar to be deleted")
+	}
+	if _, ok := c.Get("tenant-b:baz"); !ok {
+		t.Fatal("expected tenant-b:baz to be retained")
 	}
 }

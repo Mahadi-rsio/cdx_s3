@@ -203,7 +203,7 @@ func (p *StaticPlugin) Provision(ctx caddy.Context) error {
 		if size <= 0 {
 			size = 1000 // Default cache capacity
 		}
-		p.cache = NewLRUCache(size)
+		p.cache = NewLRUCache(size, p.maxCacheSize)
 	}
 
 	// Initialize S3 Presign Client if redirect and presign are enabled
