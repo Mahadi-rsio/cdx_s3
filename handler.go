@@ -51,20 +51,20 @@ func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 			return caddyhttp.Error(http.StatusNotFound, fmt.Errorf("tenant %q not found", subdomain))
 		}
 
-		// 3. Build S3 key: {site_id}/{path}
+		// 3. Build S3 key: {prefix}/{site_id}/{path} (default prefix: tenant)
 		cleanPath := strings.TrimPrefix(urlPath, "/")
 		var s3Key string
 		if urlPath == "/" || urlPath == "" || cleanPath == "" {
-			s3Key = siteID + "/index.html"
+			s3Key = p.siteObjectKey(siteID, "index.html")
 		} else {
-			s3Key = siteID + "/" + cleanPath
+			s3Key = p.siteObjectKey(siteID, cleanPath)
 		}
 
 		// 4. SPA fallback: paths without extension (and not excluded) serve index.html
 		isFallbackRequest := false
 		if p.Fallback != "" {
 			if urlPath == "/" || urlPath == "" || (!hasExtension(urlPath) && !p.isExcludedFromFallback(urlPath)) {
-				s3Key = siteID + "/index.html"
+				s3Key = p.siteObjectKey(siteID, "index.html")
 				isFallbackRequest = true
 			}
 		}
@@ -79,7 +79,7 @@ func (p *StaticPlugin) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		err = p.serveObjectWithCacheKey(rec, r, s3Key, cacheKey, isFallbackRequest)
 		if err != nil {
 			if p.Fallback != "" && !isFallbackRequest && p.isNotFoundError(err) && !p.isExcludedFromFallback(urlPath) {
-				fallbackKey := siteID + "/index.html"
+				fallbackKey := p.siteObjectKey(siteID, "index.html")
 				fallbackCacheKey := subdomain + ":" + fallbackKey
 				return p.serveObjectWithCacheKey(rec, r, fallbackKey, fallbackCacheKey, true)
 			}
@@ -718,4 +718,18 @@ func (p *StaticPlugin) isExcludedFromFallback(path string) bool {
 
 func hasExtension(path string) bool {
 	return filepath.Ext(path) != ""
+}
+
+// siteObjectKey builds the S3 object key for a tenant site in multi-tenant mode.
+// Format: {prefix}/{site_id}/{relativePath}
+func (p *StaticPlugin) siteObjectKey(siteID, relativePath string) string {
+	base := siteID
+	if p.Prefix != "" {
+		base = strings.TrimSuffix(p.Prefix, "/") + "/" + siteID
+	}
+	relativePath = strings.TrimPrefix(relativePath, "/")
+	if relativePath == "" {
+		return base + "/index.html"
+	}
+	return base + "/" + relativePath
 }

@@ -216,6 +216,45 @@ func TestProvisionDefaults(t *testing.T) {
 	}
 }
 
+func TestSiteObjectKey(t *testing.T) {
+	p := StaticPlugin{Prefix: "tenant"}
+	tests := []struct {
+		siteID   string
+		path     string
+		expected string
+	}{
+		{"787746-ghjdgh-675", "index.html", "tenant/787746-ghjdgh-675/index.html"},
+		{"787746-ghjdgh-675", "assets/app.css", "tenant/787746-ghjdgh-675/assets/app.css"},
+		{"787746-ghjdgh-675", "", "tenant/787746-ghjdgh-675/index.html"},
+	}
+	for _, tt := range tests {
+		got := p.siteObjectKey(tt.siteID, tt.path)
+		if got != tt.expected {
+			t.Errorf("siteObjectKey(%q, %q): expected %q, got %q", tt.siteID, tt.path, tt.expected, got)
+		}
+	}
+}
+
+func TestProvisionMultiTenantPrefixDefault(t *testing.T) {
+	os.Setenv("S3_ACCESS_KEY", "env-access-key")
+	os.Setenv("S3_SECRET_KEY", "env-secret-key")
+	defer func() {
+		os.Unsetenv("S3_ACCESS_KEY")
+		os.Unsetenv("S3_SECRET_KEY")
+	}()
+	p := StaticPlugin{
+		Bucket:     "test-bucket",
+		BaseDomain: "cloudisy.com",
+	}
+	err := p.Provision(caddy.Context{})
+	if err != nil {
+		t.Logf("Provision returned error (expected in mock environment): %v", err)
+	}
+	if p.Prefix != "tenant" {
+		t.Errorf("Prefix: expected default 'tenant' in multi-tenant mode, got %q", p.Prefix)
+	}
+}
+
 func boolPtr(b bool) *bool {
 	return &b
 }

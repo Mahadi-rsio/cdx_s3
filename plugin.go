@@ -139,6 +139,11 @@ func (p *StaticPlugin) Provision(ctx caddy.Context) error {
 		p.analytics = NewAnalyticsMiddleware(p.redisClient, p.db)
 	}
 
+	// Multi-tenant live files live at {prefix}/{site_id}/ in the bucket.
+	if p.BaseDomain != "" && p.Prefix == "" {
+		p.Prefix = "tenant"
+	}
+
 	// SPA Fallback: hardcoded to "index.html" in multi-tenant mode.
 	// Can be disabled by setting fallback to "none" or "" in single-tenant mode.
 	if p.Fallback == "" {

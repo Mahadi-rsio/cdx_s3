@@ -61,7 +61,9 @@ Add the `static_s3` directive inside your site block.
             redis_url "redis://localhost:6379/0"
 
             # --- Routing & Paths ---
-            # Sub-folder prefix inside the S3 bucket (single-tenant mode only). (Optional)
+            # Sub-folder prefix inside the S3 bucket. (Optional)
+            # In multi-tenant mode, defaults to "tenant" → keys like tenant/{site_id}/index.html.
+            # In single-tenant mode, prepended to the request path.
             prefix "public/"
             
             # SPA fallback file. Default: "index.html". Use "none" to disable. (Optional)
@@ -119,10 +121,10 @@ tenant-a.cloudisy.com/about
              → cache UUID in Redis (TTL 5 min)
         │
         ▼
-  3. Build S3 key  →  "{UUID}/about/index.html"
+  3. Build S3 key  →  "tenant/{UUID}/about/index.html"
         │
         ▼
-  4. Serve from S3 (LRU cached as "tenant-a:{UUID}/about/index.html")
+  4. Serve from S3 (LRU cached as "tenant-a:tenant/{UUID}/about/index.html")
 ```
 
 ### PostgreSQL schema
@@ -140,17 +142,18 @@ CREATE INDEX idx_sites_subdomain ON sites(subdomain);
 
 ### S3 directory structure
 
-Each tenant's files must live under their `site_id` UUID as the root prefix:
+Each tenant's files must live under `tenant/{site_id}/` in the bucket:
 
 ```
 my-bucket/
-├── 550e8400-e29b-41d4-a716-446655440000/   ← tenant-a's UUID
-│   ├── index.html
-│   ├── about/index.html
-│   └── assets/app.css
-└── 6ba7b810-9dad-11d1-80b4-00c04fd430c8/   ← tenant-b's UUID
-    ├── index.html
-    └── blog/index.html
+└── tenant/
+    ├── 550e8400-e29b-41d4-a716-446655440000/   ← tenant-a's site_id
+    │   ├── index.html
+    │   ├── about/index.html
+    │   └── assets/app.css
+    └── 6ba7b810-9dad-11d1-80b4-00c04fd430c8/   ← tenant-b's site_id
+        ├── index.html
+        └── blog/index.html
 ```
 
 ### Redis cache behaviour
