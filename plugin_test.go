@@ -1,8 +1,10 @@
 package cdx_s3
 
 import (
+	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -216,45 +218,142 @@ func TestProvisionDefaults(t *testing.T) {
 	}
 }
 
-func TestSiteObjectKey(t *testing.T) {
-	p := StaticPlugin{Prefix: "tenant"}
+func TestBlobObjectKey(t *testing.T) {
 	tests := []struct {
-		siteID   string
-		path     string
+		hash     string
 		expected string
 	}{
-		{"787746-ghjdgh-675", "index.html", "tenant/787746-ghjdgh-675/index.html"},
-		{"787746-ghjdgh-675", "assets/app.css", "tenant/787746-ghjdgh-675/assets/app.css"},
-		{"787746-ghjdgh-675", "", "tenant/787746-ghjdgh-675/index.html"},
+		{"abc123", "blobs/abc123"},
+		{"sha256deadbeef", "blobs/sha256deadbeef"},
 	}
 	for _, tt := range tests {
-		got := p.siteObjectKey(tt.siteID, tt.path)
+		got := blobObjectKey(tt.hash)
 		if got != tt.expected {
-			t.Errorf("siteObjectKey(%q, %q): expected %q, got %q", tt.siteID, tt.path, tt.expected, got)
+			t.Errorf("blobObjectKey(%q): expected %q, got %q", tt.hash, tt.expected, got)
 		}
 	}
 }
 
-func TestProvisionMultiTenantPrefixDefault(t *testing.T) {
-	os.Setenv("S3_ACCESS_KEY", "env-access-key")
-	os.Setenv("S3_SECRET_KEY", "env-secret-key")
-	defer func() {
-		os.Unsetenv("S3_ACCESS_KEY")
-		os.Unsetenv("S3_SECRET_KEY")
-	}()
-	p := StaticPlugin{
-		Bucket:     "test-bucket",
-		BaseDomain: "cloudisy.com",
+func TestPathCandidates(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected []string
+	}{
+		{"/", []string{"index.html"}},
+		{"", []string{"index.html"}},
+		{"/about", []string{"about/index.html", "about.html", "about"}},
+		{"/about/", []string{"about/index.html", "about.html", "about"}},
+		{"/assets/app.js", []string{"assets/app.js"}},
+		{"/style.css", []string{"style.css"}},
 	}
-	err := p.Provision(caddy.Context{})
-	if err != nil {
-		t.Logf("Provision returned error (expected in mock environment): %v", err)
+	for _, tt := range tests {
+		got := pathCandidates(tt.path)
+		if !reflect.DeepEqual(got, tt.expected) {
+			t.Errorf("pathCandidates(%q): expected %v, got %v", tt.path, tt.expected, got)
+		}
 	}
-	if p.Prefix != "tenant" {
-		t.Errorf("Prefix: expected default 'tenant' in multi-tenant mode, got %q", p.Prefix)
+}
+
+func TestCacheControlForPath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"index.html", "no-cache"},
+		{"about/index.html.br", "no-cache"},
+		{"assets/app.js", "max-age=31536000, immutable"},
+		{"assets/app.js.gz", "max-age=31536000, immutable"},
+		{"styles.css", "max-age=31536000, immutable"},
+		{"font.woff2", "max-age=31536000, immutable"},
+		{"logo.png", "max-age=604800"},
+		{"photo.jpg.webp", "max-age=604800"},
+		{"data.json", "max-age=3600"},
+	}
+	for _, tt := range tests {
+		got := cacheControlForPath(tt.path)
+		if got != tt.expected {
+			t.Errorf("cacheControlForPath(%q): expected %q, got %q", tt.path, tt.expected, got)
+		}
+	}
+}
+
+func TestContentTypeForPath(t *testing.T) {
+	tests := []struct {
+		path     string
+		contains string // substring expected in content type
+	}{
+		{"index.html", "text/html"},
+		{"index.html.br", "text/html"},
+		{"app.js.gz", "javascript"},
+		{"logo.png", "image/png"},
+	}
+	for _, tt := range tests {
+		got := contentTypeForPath(tt.path)
+		if !strings.Contains(got, tt.contains) {
+			t.Errorf("contentTypeForPath(%q): expected to contain %q, got %q", tt.path, tt.contains, got)
+		}
+	}
+}
+
+func TestPickVariantMap(t *testing.T) {
+	entries := map[string]string{
+		"about/index.html":    "hash-raw",
+		"about/index.html.br": "hash-br",
+		"about/index.html.gz": "hash-gz",
+		"logo.png":            "hash-png",
+		"logo.png.webp":       "hash-webp",
+	}
+
+	res := pickVariantMap(entries, "about/index.html", "br, gzip", "")
+	if res == nil || res.BlobHash != "hash-br" || res.ContentEncoding != "br" {
+		t.Fatalf("expected br variant, got %+v", res)
+	}
+
+	res = pickVariantMap(entries, "about/index.html", "gzip", "")
+	if res == nil || res.BlobHash != "hash-gz" || res.ContentEncoding != "gzip" {
+		t.Fatalf("expected gzip variant, got %+v", res)
+	}
+
+	res = pickVariantMap(entries, "about/index.html", "", "")
+	if res == nil || res.BlobHash != "hash-raw" || res.ContentEncoding != "" {
+		t.Fatalf("expected raw variant, got %+v", res)
+	}
+
+	res = pickVariantMap(entries, "logo.png", "", "text/html, image/webp, */*")
+	if res == nil || res.BlobHash != "hash-webp" {
+		t.Fatalf("expected webp variant, got %+v", res)
+	}
+
+	res = pickVariantMap(entries, "missing.html", "br", "")
+	if res != nil {
+		t.Fatalf("expected nil for missing path, got %+v", res)
+	}
+}
+
+func TestRequestEncodingKey(t *testing.T) {
+	r := &http.Request{Header: http.Header{}}
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	if got := requestEncodingKey(r, "/about"); got != "br" {
+		t.Errorf("expected br, got %s", got)
+	}
+
+	r.Header.Set("Accept-Encoding", "gzip")
+	if got := requestEncodingKey(r, "/about"); got != "gz" {
+		t.Errorf("expected gz, got %s", got)
+	}
+
+	r.Header.Del("Accept-Encoding")
+	if got := requestEncodingKey(r, "/about"); got != "raw" {
+		t.Errorf("expected raw, got %s", got)
+	}
+
+	r.Header.Set("Accept", "image/webp")
+	if got := requestEncodingKey(r, "/logo.png"); got != "webp" {
+		t.Errorf("expected webp, got %s", got)
 	}
 }
 
 func boolPtr(b bool) *bool {
 	return &b
 }
+

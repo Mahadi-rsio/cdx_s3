@@ -2,23 +2,26 @@
 
 `static_s3` is a middleware plugin for Caddy v2 that serves static files directly from AWS S3 or any S3-compatible storage (like MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, or Google Cloud Storage).
 
-It is designed for production environment efficiency, security, and scalability, featuring built-in streaming, caching, range requests, SPA routing, **multi-tenant subdomain routing**, and support for AWS credentials chains.
+It is designed for production efficiency, security, and scalability, featuring built-in streaming, caching, range requests, SPA routing, **multi-tenant blob-direct serving**, and support for AWS credentials chains.
 
 ---
 
 ## Key Features
 
-- **Multi-Tenant Subdomain Routing:** Route `tenant-a.cloudisy.com` → its own S3 directory, resolved via Redis cache + PostgreSQL. Zero per-tenant config — just insert a row.
+- **Multi-Tenant Blob-Direct Serving:** Route `tenant-a.cloudisy.com` → resolve `site_id` via Redis/PostgreSQL → look up the file in a Redis path map (`site_files:{site_id}`) → stream `blobs/{sha256}` from MinIO. Zero per-tenant Caddy config.
+- **Pre-compressed & WebP variants:** Automatically selects `.br`, `.gz`, or `.webp` variants from the path map based on `Accept-Encoding` / `Accept`.
 - **Universal S3 Compatibility:** Works with any S3-compliant storage by configuring custom endpoints and region settings.
-- **Memory-Efficient Streaming:** Streams files directly from S3 to the client. Never loads large files (e.g., video or large images) entirely into Caddy's memory, avoiding Out-Of-Memory (OOM) crashes.
-- **High-Performance Caching:** Features a thread-safe LRU Cache with configurable TTL:
-  - Caches metadata (ETags, Last-Modified, size) to quickly respond to conditional client requests.
-  - Caches actual file content for small files to completely bypass S3 API requests.
-  - Caches missing files (negative caching) to prevent hammering S3 on recurrent 404s.
-  - In multi-tenant mode, cache keys are scoped per-tenant (`subdomain:s3key`) to prevent cross-tenant collisions.
-- **Standard Range Requests:** Supports streaming media ranges (`Content-Range` / `Accept-Ranges`) directly through S3 range headers.
-- **Ambient Credentials support:** Access keys and secret keys are optional. If omitted, the plugin defaults to standard AWS credentials chain (supports IAM Roles, EKS Service Accounts, ECS Tasks, EC2 Instance Profiles, or environment variables).
-- **Advanced SPA Routing:** Configurable Single Page Application (SPA) fallback (e.g., `index.html`) with customizable file extension exclusions (e.g., return a 404 instead of index.html if a `.png` or `.css` file is missing).
+- **Memory-Efficient Streaming:** Streams files directly from S3 to the client. Never loads large files entirely into Caddy's memory.
+- **High-Performance Caching:** Thread-safe LRU cache with configurable TTL:
+  - Path resolution cache: `{subdomain}:{version}:{path}:{encoding}` → blob hash (skips Redis on hit)
+  - Negative cache: `{subdomain}:{version}:{path}:404` (1 minute TTL)
+  - File content cache: `{subdomain}:{version}:{path}:{encoding}:body`
+  - Version key: `{subdomain}:__version__` (from Redis `site_version:{site_id}`)
+  - Instant deploy invalidation via version bump — old LRU entries become unreachable without a prefix scan
+- **Browser Cache Headers:** Sets `Cache-Control` by file type; `Vary: Accept-Encoding` when serving br/gz variants.
+- **Standard Range Requests:** Passes `Range` through to MinIO on `blobs/{hash}` unchanged.
+- **Ambient Credentials support:** Access keys are optional; falls back to the standard AWS credentials chain (IAM Roles, EKS/ECS/EC2, env vars).
+- **Advanced SPA Routing:** Falls back to `index.html` when no path candidate matches, with configurable extension exclusions.
 
 ---
 
@@ -54,16 +57,16 @@ Add the `static_s3` directive inside your site block.
             # e.g. "cloudisy.com" → extracts "tenant-a" from "tenant-a.cloudisy.com"
             base_domain "cloudisy.com"
             
-            # PostgreSQL DSN for site_id lookups. Falls back to DATABASE_URL env var. (Optional)
+            # PostgreSQL DSN for site_id and blob-tree lookups. Falls back to DATABASE_URL. (Optional)
             db_dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable"
             
-            # Redis URL for site_id caching. Falls back to REDIS_URL env var. (Optional)
+            # Redis URL for site:, site_version:, and site_files: keys. Falls back to REDIS_URL. (Optional)
             redis_url "redis://localhost:6379/0"
 
             # --- Routing & Paths ---
             # Sub-folder prefix inside the S3 bucket. (Optional)
-            # In multi-tenant mode, defaults to "tenant" → keys like tenant/{site_id}/index.html.
-            # In single-tenant mode, prepended to the request path.
+            # Only used in single-tenant mode (prepended to the request path).
+            # Multi-tenant mode always serves blobs/{hash} — prefix is ignored.
             prefix "public/"
             
             # SPA fallback file. Default: "index.html". Use "none" to disable. (Optional)
@@ -86,7 +89,7 @@ Add the `static_s3` directive inside your site block.
 
             # --- Bandwidth Optimization (S3 Redirection) ---
             # Redirect the client directly to the S3 bucket URL to bypass VPS network bandwidth. (Optional)
-            # Default: false
+            # Default: false. In multi-tenant mode redirects to blobs/{hash}.
             redirect_to_s3 true
 
             # Generate a temporary pre-signed URL for redirects to keep private buckets secure. (Optional)
@@ -104,7 +107,7 @@ Add the `static_s3` directive inside your site block.
 
 ## Multi-Tenant Mode
 
-When `base_domain` is set, the plugin switches into **multi-tenant mode**. Each unique subdomain is mapped to its own S3 directory via a UUID stored in PostgreSQL, with Redis acting as a read-through cache.
+When `base_domain` is set, the plugin switches into **multi-tenant blob-direct mode**. Subdomains resolve to a `site_id`; file paths resolve through a Redis hash to content-addressed blobs.
 
 ### How a request is handled
 
@@ -112,19 +115,48 @@ When `base_domain` is set, the plugin switches into **multi-tenant mode**. Each 
 tenant-a.cloudisy.com/about
         │
         ▼
-  1. Extract subdomain  →  "tenant-a"
+  1. Extract subdomain → "tenant-a"
         │
         ▼
   2. Redis GET "site:tenant-a"
-       hit  → use cached UUID
-       miss → SELECT id FROM sites WHERE subdomain='tenant-a' AND active=true
-             → cache UUID in Redis (TTL 5 min)
+       hit  → site_id
+       miss → evict LRU "{subdomain}:__version__"
+             → PostgreSQL lookup → cache (TTL 5 min)
+             NOT_FOUND → 404
         │
         ▼
-  3. Build S3 key  →  "tenant/{UUID}/about/index.html"
+  2b. Resolve deploy version:
+       LRU "{subdomain}:__version__" → hit
+       miss → Redis GET "site_version:{site_id}" (default "0")
+             → cache in LRU with cache_ttl
         │
         ▼
-  4. Serve from S3 (LRU cached as "tenant-a:tenant/{UUID}/about/index.html")
+  3. Resolve path candidates:
+       /about → ["about/index.html", "about.html", "about"]
+        │
+        ▼
+  4. For each candidate, pick best variant via HGET site_files:{site_id}:
+       Accept-Encoding: br   → try "{candidate}.br", else "{candidate}"
+       Accept-Encoding: gzip → try "{candidate}.gz", else "{candidate}"
+       Accept: image/webp    → try "{candidate}.webp" (image paths), else raw
+       no encoding           → "{candidate}"
+       first hit → proceed; all miss → next candidate
+        │
+        ▼
+  5. All candidates miss → SPA fallback:
+       path has fallback_except extension → 404
+       otherwise → HGET "index.html" (same Accept-Encoding logic)
+                   miss → 404
+        │
+        ▼
+  6. site_files:{site_id} key missing (TTL expired):
+       SELECT path, blob_hash FROM blob_tree_entries
+         JOIN deployments ON ... WHERE is_active AND site_id = $1
+       Serve current request from PostgreSQL result immediately
+       Rebuild Redis hash (DEL → HSET → EXPIRE 86400) in background
+        │
+        ▼
+  7. Stream from MinIO: blobs/{blob_hash}
 ```
 
 ### PostgreSQL schema
@@ -138,30 +170,93 @@ CREATE TABLE sites (
 );
 
 CREATE INDEX idx_sites_subdomain ON sites(subdomain);
+
+-- Active deployment + file tree (used when site_files Redis key expires)
+CREATE TABLE deployments (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    site_id    UUID NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    is_active  BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE blob_tree_entries (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    deployment_id UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    path          TEXT NOT NULL,   -- e.g. "about/index.html", "about/index.html.br"
+    blob_hash     TEXT NOT NULL    -- SHA256 of blob content
+);
 ```
 
-### S3 directory structure
+### S3 / MinIO layout
 
-Each tenant's files must live under `tenant/{site_id}/` in the bucket:
+All tenants share one content-addressed blob store. There is no `tenant/{site_id}/` prefix.
 
 ```
 my-bucket/
-└── tenant/
-    ├── 550e8400-e29b-41d4-a716-446655440000/   ← tenant-a's site_id
-    │   ├── index.html
-    │   ├── about/index.html
-    │   └── assets/app.css
-    └── 6ba7b810-9dad-11d1-80b4-00c04fd430c8/   ← tenant-b's site_id
-        ├── index.html
-        └── blog/index.html
+└── blobs/
+    ├── a1b2c3d4e5f6...   ← SHA256 of file content
+    ├── 9f8e7d6c5b4a...
+    └── ...
 ```
 
-### Redis cache behaviour
+### Redis keys
 
 | Scenario | Redis key | Value | TTL |
 |---|---|---|---|
-| Tenant found | `site:tenant-a` | UUID string | 5 min |
+| Tenant found | `site:tenant-a` | site UUID | 5 min |
 | Tenant not found | `site:ghost` | `NOT_FOUND` | 1 min |
+| Deploy version | `site_version:{site_id}` | integer counter (string) | none (permanent) |
+| File path map | `site_files:{site_id}` | Hash: field=`path` (incl. `.br`/`.gz`/`.webp`), value=`blob_hash` | 24 h (rebuilt from PG on miss) |
+
+Path lookups use **HGET per candidate only** — never `HGETALL`.
+
+`site_version:{site_id}` has no TTL. The backend should `INCR` it after every successful commit/rollback, and `DEL` it when the site is deleted.
+
+### LRU cache (multi-tenant)
+
+| Key | Value | TTL |
+|---|---|---|
+| `{subdomain}:__version__` | deploy version string | `cache_ttl` |
+| `{subdomain}:{version}:{path}:{br\|gz\|webp\|raw}` | blob hash | `cache_ttl` |
+| `{subdomain}:{version}:{path}:404` | `NOT_FOUND` | 1 min |
+| `{subdomain}:{version}:{path}:{encoding}:body` | file body and/or metadata | `cache_ttl` |
+
+On LRU path hit: skip all Redis calls, go straight to MinIO (or serve cached body).
+
+The version key is **not** version-scoped. All other keys include the version so a deploy bump makes old entries unreachable without scanning the LRU.
+
+### Browser Cache-Control
+
+| File | Cache-Control |
+|---|---|
+| `.html` | `no-cache` |
+| `.js`, `.css`, `.woff`, `.woff2` | `max-age=31536000, immutable` |
+| `.webp`, `.png`, `.jpg`, `.gif`, `.svg` | `max-age=604800` |
+| everything else | `max-age=3600` |
+
+Content-Type is inferred from the original file path (`.br`/`.gz` stripped). Never from the blob key. `Vary: Accept-Encoding` is set when serving br/gz variants.
+
+### Cache invalidation on deploy
+
+```
+Deploy / rollback succeeds
+      ↓
+Backend: INCR site_version:{site_id}  →  "8"
+Backend: DEL site:{subdomain}
+Backend: DEL site_files:{site_id}     (optional; rebuilt on miss)
+      ↓
+Next request hits Caddy:
+  Redis GET site:mysite → miss
+  → evict LRU "mysite:__version__" only
+  → PostgreSQL lookup → site_id → cache site:mysite
+  → Redis GET site_version:{site_id} → "8"
+  → LRU store "mysite:__version__" = "8"
+  → subsequent lookups use "mysite:8:..."
+  → old "mysite:7:*" keys are never looked up again
+  → naturally evicted by LRU capacity or TTL
+```
+
+No prefix scan, no Admin API — version scoping is the only invalidation mechanism.
 
 ### Managing tenants
 
@@ -173,8 +268,13 @@ psql -c "INSERT INTO sites (subdomain) VALUES ('tenant-a');"
 psql -c "UPDATE sites SET active=false WHERE subdomain='tenant-a';"
 redis-cli DEL site:tenant-a
 
-# Force cache refresh (e.g. after re-enabling a tenant)
+# After deploy / rollback (backend should do this)
+redis-cli INCR site_version:{site_id}
 redis-cli DEL site:tenant-a
+redis-cli DEL site_files:{site_id}
+
+# On site delete
+redis-cli DEL site:tenant-a site_files:{site_id} site_version:{site_id}
 ```
 
 ### Environment variables (multi-tenant)
@@ -216,20 +316,25 @@ redis-cli DEL site:tenant-a
 
 ---
 
-## 🚀 S3 Redirection (Bandwidth Optimization / BDIX)
+## Single-Tenant Mode
+
+When `base_domain` is not set, the plugin serves objects by request path (optionally under `prefix`). SPA fallback, LRU content cache, range requests, and S3 redirect options work as before.
+
+---
+
+## S3 Redirection (Bandwidth Optimization / BDIX)
 
 For platforms with high traffic or hosting massive static media files, routing all traffic through your VPS can consume excessive bandwidth and cause latency.
 
 By enabling `redirect_to_s3 true`, Caddy will:
-1. Validate the file existence locally (checking the cache or running a cheap `HeadObject` request).
-2. Catch missing files and run local SPA index fallback routing.
-3. Redirect the client's browser (HTTP `307 Temporary Redirect`) directly to the S3 provider.
+1. Resolve the blob (multi-tenant) or object key (single-tenant) via cache / Redis / HeadObject.
+2. Catch missing files and run SPA fallback where applicable.
+3. Redirect the client's browser (HTTP `307 Temporary Redirect`) directly to the S3 provider (`blobs/{hash}` in multi-tenant mode).
 
-This shifts **100% of the download bandwidth** to your S3 provider. If your S3 provider has unlimited bandwidth (e.g., via BDIX or direct peering), this results in completely free egress and high download speeds while keeping VPS resource usage at zero.
+This shifts **100% of the download bandwidth** to your S3 provider.
 
 ### Private Buckets Security
 If your S3 bucket is private, enable `presign_redirect true`. Caddy will generate a temporary pre-signed S3 URL on the fly (locally, using your access/secret keys with no S3 API network calls) and redirect the client to that secure URL.
-
 
 ---
 
@@ -285,9 +390,10 @@ static_s3 {
 ├── go.sum             # Go dependencies checksum file
 ├── cache.go           # LRU cache implementation with TTL
 ├── cache_test.go      # LRU cache unit tests
-├── handler.go         # Core middleware, S3 requests, multi-tenant routing, and streaming logic
+├── handler.go         # Core middleware, blob resolution, multi-tenant routing, streaming
 ├── plugin.go          # Caddy registration, configuration parser, PostgreSQL & Redis setup
 ├── plugin_test.go     # Plugin & parser unit tests
+├── analytics.go       # Per-site analytics middleware
 ├── sql_helpers.go     # Internal sql.ErrNoRows bridge
 └── README.md          # Project documentation
 ```

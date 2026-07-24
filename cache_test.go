@@ -96,21 +96,17 @@ func TestLRUCache_Eviction(t *testing.T) {
 	}
 }
 
-func TestLRUCache_DeleteByPrefix(t *testing.T) {
+func TestLRUCache_Delete(t *testing.T) {
 	c := NewLRUCache(5, 0)
 
-	c.Set("tenant-a:foo", &CacheItem{Key: "tenant-a:foo", Exists: true}, 1*time.Minute)
-	c.Set("tenant-a:bar", &CacheItem{Key: "tenant-a:bar", Exists: true}, 1*time.Minute)
-	c.Set("tenant-b:baz", &CacheItem{Key: "tenant-b:baz", Exists: true}, 1*time.Minute)
+	c.Set("tenant-a:__version__", &CacheItem{Key: "tenant-a:__version__", Exists: true}, 1*time.Minute)
+	c.Set("tenant-a:8:/about:br", &CacheItem{Key: "tenant-a:8:/about:br", Exists: true}, 1*time.Minute)
 
-	c.DeleteByPrefix("tenant-a:")
-	if _, ok := c.Get("tenant-a:foo"); ok {
-		t.Fatal("expected tenant-a:foo to be deleted")
+	c.Delete("tenant-a:__version__")
+	if _, ok := c.Get("tenant-a:__version__"); ok {
+		t.Fatal("expected version key to be deleted")
 	}
-	if _, ok := c.Get("tenant-a:bar"); ok {
-		t.Fatal("expected tenant-a:bar to be deleted")
-	}
-	if _, ok := c.Get("tenant-b:baz"); !ok {
-		t.Fatal("expected tenant-b:baz to be retained")
+	if _, ok := c.Get("tenant-a:8:/about:br"); !ok {
+		t.Fatal("expected unrelated key to be retained")
 	}
 }

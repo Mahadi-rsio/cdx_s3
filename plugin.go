@@ -33,6 +33,8 @@ type StaticPlugin struct {
 	Region       string `json:"region,omitempty"`
 	UsePathStyle *bool  `json:"use_path_style,omitempty"`
 
+	// Prefix is only used in single-tenant mode (prepended to the request path).
+	// Multi-tenant mode always serves content-addressed blobs/{hash} keys.
 	Prefix         string   `json:"prefix,omitempty"`
 	Fallback       string   `json:"fallback,omitempty"`
 	FallbackExcept []string `json:"fallback_except,omitempty"`
@@ -130,18 +132,13 @@ func (p *StaticPlugin) Provision(ctx caddy.Context) error {
 		if err := rdb.Ping(pingCtx).Err(); err != nil {
 			return fmt.Errorf("static_s3: redis ping failed: %w", err)
 		}
-			p.redisClient = rdb
+		p.redisClient = rdb
 	}
 
 	// Initialize analytics middleware when both Redis and PostgreSQL are
 	// available and the operator has not explicitly disabled it.
 	if p.db != nil && p.redisClient != nil && p.AnalyticsEnabled {
 		p.analytics = NewAnalyticsMiddleware(p.redisClient, p.db)
-	}
-
-	// Multi-tenant live files live at {prefix}/{site_id}/ in the bucket.
-	if p.BaseDomain != "" && p.Prefix == "" {
-		p.Prefix = "tenant"
 	}
 
 	// SPA Fallback: hardcoded to "index.html" in multi-tenant mode.

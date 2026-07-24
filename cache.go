@@ -2,20 +2,22 @@ package cdx_s3
 
 import (
 	"container/list"
-	"strings"
 	"sync"
 	"time"
 )
 
 type CacheItem struct {
-	Key          string
-	ETag         string
-	LastModified time.Time
-	Size         int64
-	ContentType  string
-	Content      []byte // Nil if only metadata is cached
-	ExpiredAt    time.Time
-	Exists       bool // Negative caching support
+	Key             string
+	ETag            string
+	LastModified    time.Time
+	Size            int64
+	ContentType     string
+	ContentEncoding string // "br", "gzip", or empty
+	FilePath        string // original site path (for mime / Cache-Control)
+	BlobHash        string // content-addressed blob SHA256
+	Content         []byte // Nil if only metadata is cached
+	ExpiredAt       time.Time
+	Exists          bool // Negative caching support
 }
 
 type cacheEntry struct {
@@ -90,15 +92,13 @@ func (c *LRUCache) Set(key string, value *CacheItem, ttl time.Duration) {
 	c.currentBytes += itemSize
 }
 
-// DeleteByPrefix deletes all cache keys matching a prefix (e.g. "tenant-uuid:")
-func (c *LRUCache) DeleteByPrefix(prefix string) {
+// Delete removes a single cache key if present.
+func (c *LRUCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for key, elem := range c.items {
-		if strings.HasPrefix(key, prefix) {
-			c.removeElement(elem)
-		}
+	if elem, ok := c.items[key]; ok {
+		c.removeElement(elem)
 	}
 }
 
